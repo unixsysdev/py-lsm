@@ -6,6 +6,7 @@ from urllib.parse import parse_qs, urlparse
 import re
 import os
 import pickle
+from datetime import datetime, timezone
 
 class MemTable:
     def __init__(self, max_size=1000):
@@ -51,6 +52,19 @@ class LSMTree:
         self.memtable = MemTable()
         self.levels = [[] for _ in range(max_levels)]
         self.max_levels = max_levels
+        self.load_existing_sstables()
+
+    def load_existing_sstables(self):
+        for level in range(self.max_levels):
+            i = 0
+            while True:
+                sstable = SSTable(level, i)
+                if os.path.exists(sstable.filename):
+                    sstable.load()
+                    self.levels[level].append(sstable)
+                    i += 1
+                else:
+                    break
 
     def put(self, key, value):
         flushed_data = self.memtable.put(key, value)
@@ -186,8 +200,8 @@ class LSMDataHandler(BaseHTTPRequestHandler):
         query = query_params['query'][0]
         print(f"Raw received query: {query}")
 
-        # Extract the actual query by finding the first occurrence of 'SELECT'
-        actual_query = query[query.upper().index('SELECT'):]
+        # Extract the actual query by finding the last occurrence of 'SELECT'
+        actual_query = query[query.upper().rindex('SELECT'):]
         print(f"Processed query: {actual_query}")
 
         results = self.process_query(actual_query)
@@ -199,9 +213,27 @@ class LSMDataHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(results).encode())
     
     def save_data(self, data):
-        key = str(int(time.time() * 1000))
-        self.lsm_tree.put(key, data)
-        print(f"Saved data: {data}")
+        parts = data.split()
+        if len(parts) < 2:
+            print(f"Invalid data format: {data}")
+            return
+
+        measurement_tags = parts[0].split(',')
+        measurement = measurement_tags[0]
+        tags = dict(tag.split('=') for tag in measurement_tags[1:] if '=' in tag)
+        fields = dict(field.split('=') for field in parts[1].split(',') if '=' in field)
+        timestamp = parts[2] if len(parts) > 2 else str(int(time.time() * 1e9))
+
+        parsed_data = {
+            "measurement": measurement,
+            "tags": tags,
+            "fields": fields,
+            "timestamp": timestamp
+        }
+
+        key = f"{measurement}:{timestamp}"
+        self.lsm_tree.put(key, json.dumps(parsed_data))
+        print(f"Saved data: {parsed_data}")
     
     def process_query(self, query):
         parser = QueryParser(query)
@@ -211,17 +243,15 @@ class LSMDataHandler(BaseHTTPRequestHandler):
         for level in range(self.lsm_tree.max_levels):
             for sstable in self.lsm_tree.levels[level]:
                 for key, value in sstable.data.items():
-                    if self.matches_query(value, parsed_query):
-                        parsed_data = self.parse_influx_data(value)
-                        if parsed_data:
-                            results.append(parsed_data)
+                    parsed_data = json.loads(value)
+                    if self.matches_query(parsed_data, parsed_query):
+                        results.append(parsed_data)
         
         # Check memtable
         for key, value in self.lsm_tree.memtable.data.items():
-            if self.matches_query(value, parsed_query):
-                parsed_data = self.parse_influx_data(value)
-                if parsed_data:
-                    results.append(parsed_data)
+            parsed_data = json.loads(value)
+            if self.matches_query(parsed_data, parsed_query):
+                results.append(parsed_data)
 
         results = self.apply_aggregations(results, parsed_query)
         results = self.apply_grouping(results, parsed_query)
@@ -230,17 +260,25 @@ class LSMDataHandler(BaseHTTPRequestHandler):
         return results
 
     def matches_query(self, data, parsed_query):
-        if parsed_query['from'] not in data:
+        if parsed_query['from'] != data['measurement']:
             return False
         
         for condition in parsed_query['where']:
             if '=' in condition:
                 key, value = condition.split('=')
-                if key.strip() not in data or value.strip().replace("'", "") not in data:
+                key = key.strip()
+                value = value.strip().replace("'", "").replace('"', '')
+                if key in data['tags']:
+                    if data['tags'][key] != value:
+                        return False
+                elif key in data['fields']:
+                    if str(data['fields'][key]) != value:
+                        return False
+                else:
                     return False
         
         if parsed_query['time_range']:
-            timestamp = int(data.split()[-1])  # Assuming timestamp is the last field
+            timestamp = int(data['timestamp'])
             start_time = self.parse_time(parsed_query['time_range']['start'])
             end_time = self.parse_time(parsed_query['time_range']['end'])
             if timestamp < start_time or timestamp > end_time:
@@ -304,26 +342,6 @@ class LSMDataHandler(BaseHTTPRequestHandler):
         if limit:
             return results[offset:offset+limit]
         return results[offset:]
-
-    def parse_influx_data(self, data):
-        parts = data.split()
-        if len(parts) < 2:
-            return None
-        
-        measurement_tags = parts[0].split(',')
-        measurement = measurement_tags[0]
-        tags = dict(tag.split('=') for tag in measurement_tags[1:] if '=' in tag)
-        
-        fields = dict(field.split('=') for field in parts[1].split(',') if '=' in field)
-        
-        timestamp = parts[2] if len(parts) > 2 else str(int(time.time() * 1e9))
-        
-        return {
-            "measurement": measurement,
-            "tags": tags,
-            "fields": fields,
-            "timestamp": timestamp
-        }
 
 def run_server(host, port):
     server_address = (host, port)
